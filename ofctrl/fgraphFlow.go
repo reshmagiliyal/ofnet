@@ -694,6 +694,7 @@ func (self *Flow) SetTunnelId(tunnelId uint64) error {
 
 // Special actions on the flow to set dscp field
 func (self *Flow) SetDscp(dscp uint8) error {
+	log.Infof("Received Set DSCP: %d", dscp)
 	action := new(FlowAction)
 	action.actionType = "setDscp"
 	action.dscp = dscp

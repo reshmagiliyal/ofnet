@@ -40,7 +40,10 @@ type OfnetDatapath interface {
 	PacketRcvd(sw *ofctrl.OFSwitch, pkt *ofctrl.PacketIn)
 
 	// Add a local endpoint to forwarding DB
-	AddLocalEndpoint(endpoint OfnetEndpoint) error
+	AddLocalEndpoint(endpoint OfnetEndpoint, dscp uint8) error
+
+	//update the dscp field in Ip packet.
+	UpdateEpg(endpoint OfnetEndpoint, dscp uint8) error
 
 	// Remove a local endpoint from forwarding DB
 	RemoveLocalEndpoint(endpoint OfnetEndpoint) error
@@ -149,6 +152,7 @@ type OfnetEndpoint struct {
 	PortNo            uint32    // Port number on originating switch
 	Timestamp         time.Time // Timestamp of the last event
 	EndpointGroupVlan uint16    // EnpointGroup Vlan, needed in non-Standalone mode of netplugin
+	DSCP              uint8
 }
 
 // OfnetPolicyRule has security rule to be installed

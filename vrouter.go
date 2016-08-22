@@ -56,6 +56,7 @@ type Vrouter struct {
 	// Flow Database
 	flowDb         map[string]*ofctrl.Flow // Database of flow entries
 	portVlanFlowDb map[uint32]*ofctrl.Flow // Database of flow entries
+	portDscpFlowDb map[uint32]*ofctrl.Flow // Database of DSCP flow entries
 	vlanDb         map[uint16]*Vlan        // Database of known vlans
 
 	myRouterMac net.HardwareAddr // Router Mac to be used
@@ -75,6 +76,7 @@ func NewVrouter(agent *OfnetAgent, rpcServ *rpc.Server) *Vrouter {
 	// Create a flow dbs and my router mac
 	vrouter.flowDb = make(map[string]*ofctrl.Flow)
 	vrouter.portVlanFlowDb = make(map[uint32]*ofctrl.Flow)
+	vrouter.portDscpFlowDb = make(map[uint32]*ofctrl.Flow)
 	vrouter.myRouterMac, _ = net.ParseMAC("00:00:11:11:11:11")
 	vrouter.vlanDb = make(map[uint16]*Vlan)
 
@@ -148,8 +150,69 @@ func (self *Vrouter) PacketRcvd(sw *ofctrl.OFSwitch, pkt *ofctrl.PacketIn) {
 func (self *Vrouter) InjectGARPs(epgID int) {
 }
 
+func (self *Vrouter) AddDscp(endpoint OfnetEndpoint, dscp uint8) error {
+	var portVlanDscp *ofctrl.Flow
+
+	log.Infof("received dscp set: for dscp: %d", dscp)
+	portVlanDscpIpv4, err := self.vlanTable.NewFlow(ofctrl.FlowMatch{
+		Priority:  FLOW_DSCP_PRIORITY,
+		InputPort: endpoint.PortNo,
+		Ethertype: 0x0800,
+	})
+	if err != nil {
+		log.Errorf("Error creating portvlan entry. Err: %v", err)
+		return err
+	}
+
+	portVlanDscpIpv6, err := self.vlanTable.NewFlow(ofctrl.FlowMatch{
+		Priority:  FLOW_DSCP_PRIORITY,
+		InputPort: endpoint.PortNo,
+		Ethertype: 0x86DD,
+	})
+	if err != nil {
+		log.Errorf("Error creating portvlan entry. Err: %v", err)
+		return err
+	}
+	if portVlanDscpIpv4 == nil {
+		portVlanDscp = portVlanDscpIpv4
+	} else {
+		portVlanDscp = portVlanDscpIpv6
+	}
+
+	vrfid := self.agent.getvrfId(endpoint.Vrf)
+
+	if *vrfid == 0 {
+		log.Errorf("Invalid vrf name:%v", endpoint.Vrf)
+		return errors.New("Invalid vrf name")
+	}
+	//set vrf id as METADATA
+	metadata, metadataMask := Vrfmetadata(*vrfid)
+
+	// Set source endpoint group if specified
+	if endpoint.EndpointGroup != 0 {
+		srcMetadata, srcMetadataMask := SrcGroupMetadata(endpoint.EndpointGroup)
+		metadata = metadata | srcMetadata
+		metadataMask = metadataMask | srcMetadataMask
+	}
+
+	portVlanDscp.SetMetadata(metadata, metadataMask)
+
+	// Set the vlan and install it
+	portVlanDscp.SetVlan(endpoint.Vlan)
+	dstGrpTbl := self.ofSwitch.GetTable(DST_GRP_TBL_ID)
+	err = portVlanDscp.Next(dstGrpTbl)
+	if err != nil {
+		log.Errorf("Error installing portvlan entry. Err: %v", err)
+		return err
+	}
+	portVlanDscp.SetDscp(dscp)
+	self.portDscpFlowDb[endpoint.PortNo] = portVlanDscp
+
+	return nil
+}
+
 // Add a local endpoint and install associated local route
-func (self *Vrouter) AddLocalEndpoint(endpoint OfnetEndpoint) error {
+func (self *Vrouter) AddLocalEndpoint(endpoint OfnetEndpoint, dscp uint8) error {
 
 	vni := self.agent.getvlanVniMap(endpoint.Vlan)
 
@@ -158,13 +221,19 @@ func (self *Vrouter) AddLocalEndpoint(endpoint OfnetEndpoint) error {
 		return errors.New("Unknown Vlan")
 	}
 
+	if dscp != 0 {
+		err := self.AddDscp(endpoint, dscp)
+		if err != nil {
+			return err
+		}
+	}
+
 	// Install a flow entry for vlan mapping and point it to IP table
 
 	portVlanFlow, err := self.vlanTable.NewFlow(ofctrl.FlowMatch{
 		Priority:  FLOW_MATCH_PRIORITY,
 		InputPort: endpoint.PortNo,
 	})
-
 	if err != nil {
 		log.Errorf("Error creating portvlan entry. Err: %v", err)
 		return err
@@ -195,7 +264,7 @@ func (self *Vrouter) AddLocalEndpoint(endpoint OfnetEndpoint) error {
 		return err
 	}
 
-	// save the flow entry
+	// save the flow entry &DSCP
 	self.portVlanFlowDb[endpoint.PortNo] = portVlanFlow
 
 	// Create the output port
@@ -257,8 +326,72 @@ func (self *Vrouter) AddLocalEndpoint(endpoint OfnetEndpoint) error {
 	return nil
 }
 
+//UpdateEpg creates a new dscp flow.
+func (self *Vrouter) UpdateEpg(endpoint OfnetEndpoint, dscp uint8) error {
+
+	log.Infof("received dscp update for port: %d  dscp: %d to be updated to: %d", endpoint.PortNo, endpoint.DSCP, dscp)
+	portVlanDscp := self.portDscpFlowDb[endpoint.PortNo]
+	if portVlanDscp != nil {
+		if endpoint.DSCP != 0 && endpoint.DSCP != dscp {
+			err := self.RemoveDscpFlow(endpoint)
+			if err != nil {
+				return err
+			}
+			err = self.AddDscp(endpoint, dscp)
+			if err != nil {
+				return err
+			}
+		} else if endpoint.DSCP != 0 && dscp == 0 {
+			err := self.RemoveDscpFlow(endpoint)
+			if err != nil {
+				return err
+			}
+		}
+	} else if endpoint.DSCP == 0 && dscp != 0 {
+		portVlanFlow := self.portVlanFlowDb[endpoint.PortNo]
+		if portVlanFlow != nil {
+			err := portVlanFlow.Delete()
+			if err != nil {
+				log.Errorf("Error deleting portvlan flow. Err: %v", err)
+			}
+			err = self.AddDscp(endpoint, dscp)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+//RemoveDscpFlow removes the dscp flow.
+func (self *Vrouter) RemoveDscpFlow(endpoint OfnetEndpoint) error {
+	portVlanDscp := self.portDscpFlowDb[endpoint.PortNo]
+	if portVlanDscp != nil {
+		err := portVlanDscp.UnsetDscp()
+		if err != nil {
+			log.Errorf("Error deleting dscp %v", err)
+			return err
+		}
+		err = portVlanDscp.Delete()
+		if err != nil {
+			log.Errorf("Error deleting dscp flow. Err: %v", err)
+			return err
+		}
+	}
+	return nil
+}
+
 // Remove local endpoint
 func (self *Vrouter) RemoveLocalEndpoint(endpoint OfnetEndpoint) error {
+
+	if endpoint.DSCP != 0 {
+		log.Infof("Received dscp delete:")
+		err := self.RemoveDscpFlow(endpoint)
+		if err != nil {
+			return err
+		}
+	}
 
 	// Remove the port vlan flow.
 	portVlanFlow := self.portVlanFlowDb[endpoint.PortNo]

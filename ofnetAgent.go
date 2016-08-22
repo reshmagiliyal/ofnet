@@ -108,7 +108,8 @@ type EndpointInfo struct {
 	EndpointGroupVlan uint16
 }
 
-const FLOW_MATCH_PRIORITY = 100        // Priority for all match flows
+const FLOW_MATCH_PRIORITY = 10         // Priority for all match flows
+const FLOW_DSCP_PRIORITY = 100         //// Priority for all dscp packets
 const FLOW_FLOOD_PRIORITY = 10         // Priority for flood entries
 const FLOW_MISS_PRIORITY = 1           // priority for table miss flow
 const FLOW_POLICY_PRIORITY_OFFSET = 10 // Priority offset for policy rules
@@ -492,9 +493,10 @@ func (self *OfnetAgent) InjectGARPs(epgID int, resp *bool) error {
 	return nil
 }
 
-// Add a local endpoint.
+// AddLocalEndpoint : Adds a local endpoint.
 // This takes ofp port number, mac address, vlan , VrfId and IP address of the port.
-func (self *OfnetAgent) AddLocalEndpoint(endpoint EndpointInfo) error {
+func (self *OfnetAgent) AddLocalEndpoint(endpoint EndpointInfo, dscp int) error {
+	var dscpUint uint8 = uint8(dscp)
 	// Add port vlan mapping
 	log.Infof("Received local endpoint add for {%+v}", endpoint)
 	self.portVlanMapMutex.Lock()
@@ -552,10 +554,11 @@ func (self *OfnetAgent) AddLocalEndpoint(endpoint EndpointInfo) error {
 		PortNo:            endpoint.PortNo,
 		Timestamp:         time.Now(),
 		EndpointGroupVlan: endpoint.EndpointGroupVlan,
+		DSCP:              dscpUint,
 	}
 
 	// Call the datapath
-	err := self.datapath.AddLocalEndpoint(*epreg)
+	err := self.datapath.AddLocalEndpoint(*epreg, dscpUint)
 	if err != nil {
 		log.Errorf("Adding endpoint (%+v) to datapath. Err: %v", epreg, err)
 		return err
@@ -586,6 +589,24 @@ func (self *OfnetAgent) AddLocalEndpoint(endpoint EndpointInfo) error {
 	self.masterDbMutex.Unlock()
 	log.Infof("Local Endpoint added and distributed successfully {%+v}", epreg)
 	return nil
+}
+
+//UpdateEpg updates the dscp field.
+func (self *OfnetAgent) UpdateEpg(portNo uint32, dscp int) error {
+	dscpUint := uint8(dscp)
+
+	// find the local copy
+	epreg, _ := self.localEndpointDb.Get(string(portNo))
+	if epreg == nil {
+		log.Errorf("Endpoint not found for port %d", portNo)
+		return errors.New("Endpoint not found")
+	}
+	ep := epreg.(*OfnetEndpoint)
+	err := self.datapath.UpdateEpg(*ep, dscpUint)
+	if err != nil {
+		log.Errorf("Error updating ipheader field with dscp:%d", dscpUint)
+	}
+	return err
 }
 
 // Remove local endpoint

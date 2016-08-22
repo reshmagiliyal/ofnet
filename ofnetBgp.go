@@ -188,7 +188,7 @@ func (self *OfnetBgp) StartProtoServer(routerInfo *OfnetProtoRouterInfo) error {
 
 	// Add the endpoint to local routing table
 
-	err = self.agent.datapath.AddLocalEndpoint(*ep)
+	err = self.agent.datapath.AddLocalEndpoint(*ep, 0)
 	if err != nil {
 		log.Errorf("Error Adding Local Bgp Endpoint for endpoint %+v,err: %v", ep, err)
 		return err

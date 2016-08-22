@@ -52,6 +52,7 @@ type VlanBridge struct {
 	nmlTable   *ofctrl.Table // OVS normal lookup table
 
 	portVlanFlowDb map[uint32]*ofctrl.Flow // Database of flow entries
+	portDscpFlowDb map[uint32]*ofctrl.Flow // data base of dscp flow entries.
 	uplinkDb       map[uint32]uint32       // Database of uplink ports
 	garpMutex      *sync.Mutex
 	epgToEPs       map[int]epgGARPInfo // Database of eps per epg
@@ -82,6 +83,7 @@ func NewVlanBridge(agent *OfnetAgent, rpcServ *rpc.Server) *VlanBridge {
 
 	// init maps
 	vlan.portVlanFlowDb = make(map[uint32]*ofctrl.Flow)
+	vlan.portDscpFlowDb = make(map[uint32]*ofctrl.Flow)
 	vlan.uplinkDb = make(map[uint32]uint32)
 	vlan.epgToEPs = make(map[int]epgGARPInfo)
 	vlan.garpMutex = &sync.Mutex{}
@@ -217,11 +219,67 @@ func (vl *VlanBridge) sendGARPAll() {
 	}
 }
 
+func (vl *VlanBridge) AddDscp(endpoint OfnetEndpoint, dscp uint8) error {
+	var portVlanDscp *ofctrl.Flow
+
+	log.Infof("received dscp set: for dscp: %d", dscp)
+	portVlanDscpIpv4, err := vl.vlanTable.NewFlow(ofctrl.FlowMatch{
+		Priority:  FLOW_DSCP_PRIORITY,
+		InputPort: endpoint.PortNo,
+		Ethertype: 0x0800,
+	})
+	if err != nil {
+		log.Errorf("Error creating portvlan entry. Err: %v", err)
+		return err
+	}
+
+	portVlanDscpIpv6, err := vl.vlanTable.NewFlow(ofctrl.FlowMatch{
+		Priority:  FLOW_DSCP_PRIORITY,
+		InputPort: endpoint.PortNo,
+		Ethertype: 0x86DD,
+	})
+	if err != nil {
+		log.Errorf("Error creating portvlan entry. Err: %v", err)
+		return err
+	}
+	if portVlanDscpIpv4 == nil {
+		portVlanDscp = portVlanDscpIpv4
+	} else {
+		portVlanDscp = portVlanDscpIpv6
+	}
+
+	vrfid := vl.agent.getvrfId(endpoint.Vrf)
+	//set vrf id as METADATA
+	metadata, metadataMask := Vrfmetadata(*vrfid)
+
+	portVlanDscp.SetMetadata(metadata, metadataMask)
+
+	dNATTbl := vl.ofSwitch.GetTable(SRV_PROXY_DNAT_TBL_ID)
+
+	err = portVlanDscp.Next(dNATTbl)
+	if err != nil {
+		log.Errorf("Error installing portvlan entry. Err: %v", err)
+		return err
+	}
+	portVlanDscp.SetDscp(dscp)
+	vl.portDscpFlowDb[endpoint.PortNo] = portVlanDscp
+
+	return nil
+}
+
 // AddLocalEndpoint Add a local endpoint and install associated local route
-func (vl *VlanBridge) AddLocalEndpoint(endpoint OfnetEndpoint) error {
+func (vl *VlanBridge) AddLocalEndpoint(endpoint OfnetEndpoint, dscp uint8) error {
+
 	log.Infof("Adding local endpoint: %+v", endpoint)
 
 	// Install a flow entry for vlan mapping and point it to Mac table
+	if dscp != 0 {
+		err := vl.AddDscp(endpoint, dscp)
+		if err != nil {
+			return err
+		}
+	}
+
 	portVlanFlow, err := vl.vlanTable.NewFlow(ofctrl.FlowMatch{
 		Priority:  FLOW_MATCH_PRIORITY,
 		InputPort: endpoint.PortNo,
@@ -230,6 +288,7 @@ func (vl *VlanBridge) AddLocalEndpoint(endpoint OfnetEndpoint) error {
 		log.Errorf("Error creating portvlan entry. Err: %v", err)
 		return err
 	}
+
 	vrfid := vl.agent.getvrfId(endpoint.Vrf)
 	//set vrf id as METADATA
 	metadata, metadataMask := Vrfmetadata(*vrfid)
@@ -252,7 +311,7 @@ func (vl *VlanBridge) AddLocalEndpoint(endpoint OfnetEndpoint) error {
 		return err
 	}
 
-	// save the flow entry
+	// save the flow entry & DSCP
 	vl.portVlanFlowDb[endpoint.PortNo] = portVlanFlow
 
 	// Install dst group entry for the endpoint
@@ -295,6 +354,63 @@ func (vl *VlanBridge) AddLocalEndpoint(endpoint OfnetEndpoint) error {
 	return nil
 }
 
+func (vl *VlanBridge) UpdateEpg(endpoint OfnetEndpoint, dscp uint8) error {
+
+	log.Infof("received dscp update for port: %d for dscp: %d to be updated to: %d", endpoint.PortNo, endpoint.DSCP, dscp)
+	portVlanDscp := vl.portDscpFlowDb[endpoint.PortNo]
+	if portVlanDscp != nil {
+		if endpoint.DSCP != 0 && endpoint.DSCP != dscp {
+			err := vl.RemoveDscpFlow(endpoint)
+			if err != nil {
+				return err
+			}
+			err = vl.AddDscp(endpoint, dscp)
+			if err != nil {
+				return err
+			}
+		} else if endpoint.DSCP != 0 && dscp == 0 {
+			err := vl.RemoveDscpFlow(endpoint)
+			if err != nil {
+				return err
+			}
+		}
+	} else if endpoint.DSCP == 0 && dscp != 0 {
+		portVlanFlow := vl.portVlanFlowDb[endpoint.PortNo]
+		if portVlanFlow != nil {
+			err := portVlanFlow.Delete()
+			if err != nil {
+				log.Errorf("Error deleting portvlan flow. Err: %v", err)
+			}
+
+			err = vl.AddDscp(endpoint, dscp)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+//RemoveDscpFlow removes the dscp flow.
+func (vl *VlanBridge) RemoveDscpFlow(endpoint OfnetEndpoint) error {
+	log.Infof("Received remove dscpFlow for %d", endpoint.PortNo)
+	portVlanDscp := vl.portDscpFlowDb[endpoint.PortNo]
+	if portVlanDscp != nil {
+		err := portVlanDscp.UnsetDscp()
+		if err != nil {
+			log.Errorf("Error deleting dscp %v", err)
+			return err
+		}
+		err = portVlanDscp.Delete()
+		if err != nil {
+			log.Errorf("Error deleting dscp flow. Err: %v", err)
+			return err
+		}
+	}
+	return nil
+}
+
 // RemoveLocalEndpoint Remove local endpoint
 func (vl *VlanBridge) RemoveLocalEndpoint(endpoint OfnetEndpoint) error {
 	// Remove the port vlan flow.
@@ -303,6 +419,13 @@ func (vl *VlanBridge) RemoveLocalEndpoint(endpoint OfnetEndpoint) error {
 		err := portVlanFlow.Delete()
 		if err != nil {
 			log.Errorf("Error deleting portvlan flow. Err: %v", err)
+		}
+	}
+
+	if endpoint.DSCP != 0 {
+		err := vl.RemoveDscpFlow(endpoint)
+		if err != nil {
+			return err
 		}
 	}
 
